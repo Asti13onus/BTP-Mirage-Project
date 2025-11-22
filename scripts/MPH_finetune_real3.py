@@ -1,0 +1,299 @@
+"""
+MPH_finetune_real3.py
+
+Final Training script for Stage 2 (Real Data Fine-tuning).
+Integrates the Differentiable Simulator for the Consistency Loss.
+"""
+
+import os
+import argparse
+import time
+from pathlib import Path
+import random
+import numpy 
+import numpy as np
+import math
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.tensorboard import SummaryWriter
+
+# Import the differentiable simulator function
+from simulate_torch import simulate_torch # <--- NEW IMPORT
+
+# Import the model skeleton created earlier
+from MPH_model_skeleton import MPHModel 
+
+# ----------------------------- UTILITY FUNCTIONS ----------------------#
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def save_checkpoint(state, fname):
+    torch.save(state, fname)
+
+# ----------------------------- 1. Real Data Loader ----------------------#
+class RealMirageDataset(Dataset):
+    """Loads sequences from real-world video folders (BVI, OTIS)."""
+    def __init__(self, root, split='train', T=5, crop_size=128, n_samples=1000):
+        super().__init__()
+        self.root = os.path.expanduser(root)
+        self.T = T
+        self.crop_size = crop_size
+
+        self.all_frame_paths = []
+        for dirpath, _, filenames in os.walk(self.root):
+            for f in sorted(filenames):
+                if f.endswith('.png') and 'gt' not in f.lower() and 'clean' not in f.lower():
+                    self.all_frame_paths.append(Path(dirpath) / f)
+
+        if not self.all_frame_paths:
+            raise FileNotFoundError(f"No usable sequence frames found in the real data root: {self.root}. Check filters.")
+
+        total_frames = len(self.all_frame_paths)
+        
+        if split == 'train':
+            rng = random.Random(42)
+            self.sequence_start_indices = rng.sample(range(total_frames - T), min(n_samples, total_frames - T))
+        elif split == 'val':
+            rng = random.Random(43) 
+            self.sequence_start_indices = rng.sample(range(total_frames - T), min(n_samples, total_frames - T))
+        else:
+             self.sequence_start_indices = []
+
+        print(f"Dataset loaded: {len(self.sequence_start_indices)} sequences for split '{split}'.")
+
+    def __len__(self):
+        return len(self.sequence_start_indices)
+
+    def __getitem__(self, idx):
+        start_frame_idx = self.sequence_start_indices[idx]
+        
+        sequence_frames = []
+        for i in range(self.T):
+            path = self.all_frame_paths[start_frame_idx + i]
+            
+            # --- TEMPORARY: Load dummy data ---
+            C = 3
+            H = W = self.crop_size
+            frame_arr = np.random.rand(H, W, C).astype(np.float32) 
+            # --- END TEMPORARY ---
+            
+            frame_tensor = torch.from_numpy(frame_arr).permute(2, 0, 1)
+            sequence_frames.append(frame_tensor)
+
+        input_seq = torch.stack(sequence_frames, dim=0) # (T, C, H, W)
+        
+        # GT is a zero tensor, as it is NOT used for unsupervised loss
+        gt = torch.zeros(3, self.crop_size, self.crop_size) 
+        
+        return {'frames': input_seq, 'gt': gt, 'meta': {}}
+
+# ----------------------------- 2. Unsupervised Losses -------------------#
+
+class TemporalConsistencyLoss(nn.Module):
+    def __init__(self, T=5):
+        super().__init__()
+        self.T = T
+        self.l1 = nn.L1Loss()
+
+    def forward(self, restored_seq: torch.Tensor, frames: torch.Tensor):
+        center_frame = frames[:, self.T // 2]
+        neighbor_frame = frames[:, self.T // 2 + 1] if self.T > 1 and self.T // 2 + 1 < self.T else frames[:, self.T // 2 - 1]
+        loss = self.l1(restored_seq, neighbor_frame)
+        return loss
+
+class SpatialSmoothnessLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.L1Loss()
+
+    def forward(self, x):
+        h_loss = self.l1(x[:, :, 1:, :], x[:, :, :-1, :])
+        w_loss = self.l1(x[:, :, :, 1:], x[:, :, :, :-1])
+        return h_loss + w_loss
+    
+# ----------------------------- 3. Trainer Logic -------------------------#
+
+class FineTuneTrainer:
+    def __init__(self, config):
+        seed_everything(config.seed)
+        self.config = config
+        
+        # model
+        self.model = MPHModel(in_ch=3, feat_ch=config.feat_ch, z_dim=config.z_dim, T=config.T)
+        self.device = torch.device('cuda' if torch.cuda.is_available() and not config.cpu else 'cpu')
+        self.model.to(self.device)
+
+        # LOAD PRETRAINED SYNTHETIC WEIGHTS
+        if config.pretrained:
+            print(f"Loading pretrained weights from: {os.path.expanduser(config.pretrained)}")
+            ckpt = torch.load(os.path.expanduser(config.pretrained), map_location=self.device)
+            model_key = 'model_state_dict' if 'model_state_dict' in ckpt else 'model'
+            self.model.load_state_dict(ckpt[model_key], strict=True)
+            print("Pretrained model loaded successfully.")
+
+        # data
+        train_ds = RealMirageDataset(config.data, split='train', T=config.T, crop_size=config.crop_size, n_samples=config.n_train)
+        val_ds = RealMirageDataset(config.data, split='val', T=config.T, crop_size=config.crop_size, n_samples=config.n_val)
+        self.train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=True)
+        self.val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=True)
+
+        # optimizer & scheduler
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        self.opt = optim.AdamW(params, lr=config.lr, weight_decay=config.weight_decay)
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.opt, T_max=max(1, config.epochs))
+
+        # losses
+        self.temporal_loss_fn = TemporalConsistencyLoss(T=config.T)
+        self.spatial_loss_fn = SpatialSmoothnessLoss()
+        
+        # Loss weights 
+        self.temp_weight = config.temp_weight
+        self.smooth_weight = config.smooth_weight
+        self.cons_weight = config.cons_weight # Consistency weight initialization
+
+        # amp scaler
+        self.scaler = GradScaler(enabled=not config.disable_amp)
+
+        # logging & checkpoint
+        self.expdir = Path(config.expdir)
+        self.expdir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=str(self.expdir / 'tb'))
+        self.best_val = float('-inf')
+
+        
+    def train(self):
+        cfg = self.config
+        global_step = 0
+        for epoch in range(cfg.epochs):
+            self.model.train()
+            epoch_loss = 0.0
+            tic = time.time()
+            for batch_idx, sample in enumerate(self.train_loader):
+                frames = sample['frames'].to(self.device)  # (B,T,C,H,W)
+                
+                with autocast(enabled=not cfg.disable_amp):
+                    # Forward Pass
+                    restored, mu, logvar = self.model(frames) 
+                    
+                    # 1. Temporal Consistency Loss 
+                    loss_temp = self.temporal_loss_fn(restored, frames)
+                    
+                    # 2. Spatial Smoothness Loss
+                    loss_smooth = self.spatial_loss_fn(restored)
+
+                    # 3. Simulator Consistency Loss (NEW)
+                    # Uses differentiable simulator to re-degrade the restored image 
+                    # based on the model's predicted turbulence (mu)
+                    sim = simulate_torch(restored, mu) # <--- DIFFERENTIABLE SIMULATOR CALL
+                    degraded_center = frames[:, cfg.T//2]
+                    loss_cons = F.l1_loss(sim, degraded_center)
+                    
+                    # 4. Total Loss (Now includes Consistency Loss)
+                    total_loss = self.temp_weight * loss_temp + \
+                                 self.smooth_weight * loss_smooth + \
+                                 self.cons_weight * loss_cons # <-- ADDED CONSISTENCY LOSS
+
+                # Backward Pass
+                self.scaler.scale(total_loss).backward()
+                
+                if cfg.grad_clip > 0:
+                    self.scaler.unscale_(self.opt)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+                self.scaler.step(self.opt)
+                self.scaler.update()
+                self.opt.zero_grad()
+
+                epoch_loss += total_loss.item()
+                if global_step % cfg.log_every == 0:
+                    self.writer.add_scalar('train/total_loss', total_loss.item(), global_step)
+                    self.writer.add_scalar('train/loss_temp', loss_temp.item(), global_step)
+                    self.writer.add_scalar('train/loss_smooth', loss_smooth.item(), global_step)
+                    self.writer.add_scalar('train/loss_cons', loss_cons.item(), global_step) # <-- Log consistency loss
+                global_step += 1
+
+            toc = time.time()
+            avg_loss = epoch_loss / len(self.train_loader)
+            print(f"Epoch {epoch+1}/{cfg.epochs} - loss {avg_loss:.4f} - time {toc-tic:.1f}s")
+            self.scheduler.step()
+
+            val_score = self.validate(epoch) 
+
+            # Checkpoint saving (using correct state_dict())
+            ckpt = {
+                'model': self.model.state_dict(),
+                'opt': self.opt.state_dict(), 
+                'epoch': epoch,
+                'config': vars(cfg),
+            }
+            ckpt_path = self.expdir / f'checkpoint_epoch{epoch+1}.pth'
+            save_checkpoint(ckpt, ckpt_path)
+            if val_score > self.best_val:
+                self.best_val = val_score
+                save_checkpoint(ckpt, self.expdir / 'best.pth')
+
+        self.writer.close()
+
+    def validate(self, epoch):
+        # Validation is kept for structure but has limited meaning without real GT
+        self.model.eval()
+        tot_loss = 0.0
+        n = 0
+        with torch.no_grad():
+            for sample in self.val_loader:
+                frames = sample['frames'].to(self.device)
+                gt = sample['gt'].to(self.device)
+                restored, _, _ = self.model(frames)
+                loss = F.l1_loss(restored, gt).item() 
+                tot_loss += loss
+                n += 1
+        avg = -tot_loss / max(1, n)
+        self.writer.add_scalar('val/loss', tot_loss / max(1, n), epoch)
+        print(f"Validation epoch {epoch+1}: loss {tot_loss / max(1,n):.4f}")
+        return avg
+
+# ----------------------------- 4. Argument parser -----------------------#
+def get_argparser():
+    p = argparse.ArgumentParser()
+    p.add_argument('--data', type=str, required=True, default='~/BTP_Mirage_Project/synth_data', help='Path to real data (BVI/OTIS)')
+    p.add_argument('--pretrained', type=str, required=True, help='Path to best model from synthetic training')
+    p.add_argument('--expdir', type=str, default='./exp_finetune', help='where to save logs and checkpoints')
+    p.add_argument('--T', type=int, default=5, help='number of frames in window')
+    p.add_argument('--crop_size', type=int, default=128)
+    p.add_argument('--batch_size', type=int, default=1)
+    p.add_argument('--epochs', type=int, default=50)
+    p.add_argument('--lr', type=float, default=1e-5)
+    p.add_argument('--weight_decay', type=float, default=1e-2)
+    p.add_argument('--feat_ch', type=int, default=64)
+    p.add_argument('--z_dim', type=int, default=32)
+    p.add_argument('--n_train', type=int, default=1000)
+    p.add_argument('--n_val', type=int, default=100)
+    p.add_argument('--num_workers', type=int, default=0)
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--grad_clip', type=float, default=1.0)
+    p.add_argument('--disable_amp', action='store_true')
+    p.add_argument('--cpu', action='store_true')
+    p.add_argument('--temp_weight', type=float, default=1.0)
+    p.add_argument('--smooth_weight', type=float, default=0.1)
+    p.add_argument('--cons_weight', type=float, default=0.01, help='Weight for the simulator consistency loss') # <-- NEW ARGUMENT
+    p.add_argument('--log_every', type=int, default=5, help='log frequency in batches') 
+    return p
+
+# ----------------------------- Main ------------------------------------#
+if __name__ == '__main__':
+    parser = get_argparser()
+    cfg = parser.parse_args()
+            
+    class TrainerWrapper(FineTuneTrainer):
+        def __init__(self, config):
+            super().__init__(config)
+            
+    trainer = TrainerWrapper(cfg)
+    trainer.train()
