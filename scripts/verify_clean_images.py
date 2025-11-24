@@ -17,9 +17,9 @@ for path in img_paths:
     except Exception as e:
         bad.append(path)
 
-print(f"✅ Verified {count} valid images.")
+print(f"Verified {count} valid images.")
 if bad:
-    print(f"⚠️ {len(bad)} bad files:")
+    print(f"{len(bad)} bad files:")
     for b in bad:
         print('  ', b)
 else:
